@@ -1,0 +1,100 @@
+name: Upload verified desktop builds to draft release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        type: string
+      windows_url:
+        required: true
+        type: string
+      windows_digest:
+        required: true
+        type: string
+      mac_url:
+        required: true
+        type: string
+      mac_digest:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Validate version and existing draft
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(gh release view "v$VERSION" --json isDraft --jq .isDraft)" = true
+      - name: Download and verify GitHub build artifacts
+        env:
+          WINDOWS_URL: ${{ inputs.windows_url }}
+          WINDOWS_DIGEST: ${{ inputs.windows_digest }}
+          MAC_URL: ${{ inputs.mac_url }}
+          MAC_DIGEST: ${{ inputs.mac_digest }}
+        run: |
+          python3 - <<'PY'
+          import os, hashlib, re, urllib.request, urllib.parse, zipfile
+          from pathlib import Path
+          from concurrent.futures import ThreadPoolExecutor
+          def download(platform):
+              url = os.environ[platform.upper() + '_URL']
+              parsed = urllib.parse.urlparse(url)
+              assert parsed.scheme == 'https' and parsed.hostname.endswith('.blob.core.windows.net')
+              digest = os.environ[platform.upper() + '_DIGEST']
+              assert re.fullmatch(r'sha256:[a-f0-9]{64}', digest)
+              root = Path(os.environ['RUNNER_TEMP']) / platform
+              root.mkdir()
+              archive = root / 'build.zip'
+              checksum = hashlib.sha256()
+              with urllib.request.urlopen(url, timeout=600) as source, archive.open('wb') as dest:
+                  while chunk := source.read(1024 * 1024):
+                      checksum.update(chunk)
+                      dest.write(chunk)
+              assert 'sha256:' + checksum.hexdigest() == digest
+              with zipfile.ZipFile(archive) as package:
+                  for name in package.namelist():
+                      assert not Path(name).is_absolute() and '..' not in Path(name).parts
+                  package.extractall(root)
+              archive.unlink()
+              print(platform + ': source artifact SHA-256 verified')
+          with ThreadPoolExecutor(max_workers=2) as pool:
+              list(pool.map(download, ['windows', 'mac']))
+          PY
+      - name: Upload installers to the existing draft
+        run: |
+          gh release upload "v$VERSION" --clobber \
+            "$RUNNER_TEMP/windows/update-$VERSION/"*.exe \
+            "$RUNNER_TEMP/mac/update-$VERSION/"*.dmg \
+            "$RUNNER_TEMP/mac/update-$VERSION/"*.zip
+      - name: Verify GitHub hashes of uploaded installers
+        run: |
+          gh release view "v$VERSION" --json assets > "$RUNNER_TEMP/release-assets.json"
+          python3 - <<'PY'
+          import os, json, hashlib
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          assets = {a['name']: a for a in json.loads((root / 'release-assets.json').read_text())['assets']}
+          verified = []
+          for platform in ['windows', 'mac']:
+              for file in (root / platform / ('update-' + os.environ['VERSION'])).iterdir():
+                  if file.suffix not in ['.exe', '.dmg', '.zip']: continue
+                  h = hashlib.sha256()
+                  with file.open('rb') as data:
+                      while chunk := data.read(1024 * 1024): h.update(chunk)
+                  asset = assets[file.name]
+                  assert asset['state'] == 'uploaded' and asset['size'] == file.stat().st_size
+                  assert asset['digest'] == 'sha256:' + h.hexdigest()
+                  verified.append(file.name)
+          assert len(verified) == 5
+          print('Verified all five uploaded installer and ZIP SHA-256 digests')
+          PY
